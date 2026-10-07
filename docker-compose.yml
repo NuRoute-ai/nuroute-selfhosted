@@ -1,0 +1,258 @@
+# NuRoute Enterprise, self-hosted. Started by install.sh; see README.md.
+#
+# Everything runs from ready-built images. Only Caddy (ports 80 and 443) is reachable from
+# outside; databases and services talk on the internal network. Settings come from .env, which
+# install.sh creates with generated secrets.
+
+x-service: &service
+  restart: unless-stopped
+  networks: [nuroute]
+
+# The routing model and model catalog arrive with the licence check-in as signed updates.
+# auth-service writes them to this volume; the services below read it and check each
+# signature themselves, against NuRoute's update key built into the images, before using anything.
+x-updates-env: &updates-env
+  NUROUTE_UPDATES_DIR: /var/lib/nuroute/updates
+
+services:
+  # ── Entry point ───────────────────────────────────────────────────────────
+  caddy:
+    <<: *service
+    image: caddy:2-alpine
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      # Caddy's site address: the domain (automatic HTTPS), or ':80' behind your own HTTPS proxy.
+      SITE_ADDRESS: ${CADDY_SITE:-${NUROUTE_DOMAIN:?set NUROUTE_DOMAIN in .env}}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api-gateway, dashboard]
+
+  # ── Data ──────────────────────────────────────────────────────────────────
+  postgres:
+    <<: *service
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nuroute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: nuroute
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U nuroute']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    <<: *service
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    <<: *service
+    image: clickhouse/clickhouse-server:24
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ['CMD', 'clickhouse-client', '--query', 'SELECT 1']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
+  nats:
+    <<: *service
+    image: nats:2.10-alpine
+    command: ['-js', '--name', 'nuroute-nats']
+
+  # Creates the databases and applies new migrations on every start, then exits.
+  migrate:
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/migrate:${NUROUTE_VERSION:?set NUROUTE_VERSION in .env}
+    restart: 'no'
+    networks: [nuroute]
+    environment:
+      POSTGRES_USER: nuroute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGHOST: postgres
+      PGPORT: '5432'
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+
+  # ── NuRoute ───────────────────────────────────────────────────────────────
+  auth-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/auth-service:${NUROUTE_VERSION}
+    volumes:
+      - updates:/var/lib/nuroute/updates
+    environment:
+      <<: *updates-env
+      NODE_ENV: production
+      PORT: 50051
+      NUROUTE_EDITION: selfhosted
+      NUROUTE_VERSION: ${NUROUTE_VERSION}
+      AUTH_DATABASE_URL: postgresql://nuroute:${POSTGRES_PASSWORD}@postgres:5432/aicp_auth
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      AUTH_ENCRYPTION_KEY: ${AUTH_ENCRYPTION_KEY:?set AUTH_ENCRYPTION_KEY in .env}
+      LICENSE_SERVER_URL: ${LICENSE_SERVER_URL:-https://license.nuroute.ai}
+      ROUTING_SERVICE_URL: routing-service:50052
+      SIGNUP_NOTIFICATION_EMAIL: ''
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      nats: { condition: service_started }
+
+  routing-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/routing-service:${NUROUTE_VERSION}
+    volumes:
+      - updates:/var/lib/nuroute/updates:ro
+    environment:
+      <<: *updates-env
+      NODE_ENV: production
+      PORT: 50052
+      ROUTING_DATABASE_URL: postgresql://nuroute:${POSTGRES_PASSWORD}@postgres:5432/aicp_routing
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      PROVIDER_SERVICE_URL: provider-service:50054
+      # Router v1 decides every auto request: this release ships no Router v2 capability bundle.
+      ROUTER_DEFAULT_VERSION: v1
+      ROUTER_V2_ENABLED: "false"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  router-model:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/router-model:${NUROUTE_VERSION}
+    volumes:
+      - updates:/var/lib/nuroute/updates:ro
+    environment:
+      <<: *updates-env
+      PORT: 50060
+
+  provider-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/provider-service:${NUROUTE_VERSION}
+    volumes:
+      - updates:/var/lib/nuroute/updates:ro
+    environment:
+      <<: *updates-env
+      NODE_ENV: production
+      PORT: 50054
+      PROVIDER_DATABASE_URL: postgresql://nuroute:${POSTGRES_PASSWORD}@postgres:5432/aicp_providers
+      PROVIDER_ENCRYPTION_KEY: ${PROVIDER_ENCRYPTION_KEY:?set PROVIDER_ENCRYPTION_KEY in .env}
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  metering-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/metering-service:${NUROUTE_VERSION}
+    environment:
+      NODE_ENV: production
+      PORT: 50055
+      CLICKHOUSE_URL: http://clickhouse:8123
+      ROUTING_DATABASE_URL: postgresql://nuroute:${POSTGRES_PASSWORD}@postgres:5432/aicp_routing
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  logging-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/logging-service:${NUROUTE_VERSION}
+    environment:
+      NODE_ENV: production
+      PORT: 50058
+      CLICKHOUSE_URL: http://clickhouse:8123
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  policy-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/policy-service:${NUROUTE_VERSION}
+    environment:
+      NODE_ENV: production
+      PORT: 50053
+      POLICY_DATABASE_URL: postgresql://nuroute:${POSTGRES_PASSWORD}@postgres:5432/aicp_policy
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      AUTH_SERVICE_URL: auth-service:50051
+      PRESIDIO_ANALYZER_URL: http://presidio-analyzer:3000
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  notification-service:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/notification-service:${NUROUTE_VERSION}
+    environment:
+      NODE_ENV: production
+      PORT: 50059
+      NATS_URL: nats://nats:4222
+
+  # PII detection for policies (Microsoft Presidio, its own public image).
+  presidio-analyzer:
+    <<: *service
+    image: ${PRESIDIO_IMAGE:-ghcr.io/data-privacy-stack/presidio-analyzer:latest}
+
+  # Prompt compression (headroom, its own public image).
+  headroom-proxy:
+    <<: *service
+    image: ${HEADROOM_IMAGE:-ghcr.io/headroomlabs-ai/headroom:latest}
+    environment:
+      HEADROOM_COMPRESS_ALLOW_REMOTE: '1'
+
+  api-gateway:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/api-gateway:${NUROUTE_VERSION}
+    volumes:
+      - updates:/var/lib/nuroute/updates:ro
+    environment:
+      <<: *updates-env
+      NODE_ENV: production
+      PORT: 3000
+      NUROUTE_EDITION: selfhosted
+      AUTH_SERVICE_URL: auth-service:50051
+      ROUTING_SERVICE_URL: routing-service:50052
+      ROUTER_MODEL_URL: router-model:50060
+      # Router v1 only (see routing-service): never wait for Router v2's estimates.
+      ROUTER_V2_ENABLED: "false"
+      POLICY_SERVICE_URL: policy-service:50053
+      PROVIDER_SERVICE_URL: provider-service:50054
+      METERING_SERVICE_URL: metering-service:50055
+      NATS_URL: nats://nats:4222
+      HEADROOM_PROXY_URL: http://headroom-proxy:8787
+      DASHBOARD_URL: https://${NUROUTE_DOMAIN}
+      DASHBOARD_BASE_PATH: /app
+      GATEWAY_URL: https://${NUROUTE_DOMAIN}
+    depends_on: [auth-service, routing-service, router-model, provider-service, metering-service, policy-service]
+
+  dashboard:
+    <<: *service
+    image: ${NUROUTE_REGISTRY:-ghcr.io/nuroute-ai}/dashboard:${NUROUTE_VERSION}
+    depends_on: [api-gateway]
+
+networks:
+  nuroute:
+
+volumes:
+  postgres_data:
+  redis_data:
+  clickhouse_data:
+  caddy_data:
+  caddy_config:
+  updates:

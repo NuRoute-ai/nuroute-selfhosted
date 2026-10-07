@@ -1,0 +1,20 @@
+# NuRoute's entry point. Serves the dashboard under /app and the API everywhere else, on one
+# domain, with HTTPS certificates obtained and renewed automatically for NUROUTE_DOMAIN.
+# Behind your own HTTPS proxy, set CADDY_SITE=:80 in .env and point the proxy at port 80.
+{$SITE_ADDRESS} {
+	encode gzip
+
+	@dashboard path /app /app/*
+	handle @dashboard {
+		reverse_proxy dashboard:3001
+	}
+
+	handle / {
+		redir * /app 302
+	}
+
+	# The API: /v1 (OpenAI-compatible), /auth, /keys, /projects and the rest.
+	handle {
+		reverse_proxy api-gateway:3000
+	}
+}

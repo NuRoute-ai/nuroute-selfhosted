@@ -1,0 +1,5 @@
+.env
+backups/
+support-bundle-*.tar.gz
+upgrade-failure-*.log
+nuroute-kit-*.tar.gz
